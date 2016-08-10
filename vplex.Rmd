@@ -1,0 +1,1063 @@
+---
+title: "VPLEX Performance analysis"
+author:
+output:
+  pdf_document:
+    fig_crop: no
+    fig_height: 10
+    fig_width: 8
+    toc: yes
+    toc_depth: 3
+  word_document: default
+---
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+library("data.table")
+library("stringr")
+library("ggplot2")
+library('RCurl')
+library('jsonlite')
+library("pander")
+
+ip <- commandArgs(trailingOnly = TRUE)[1]
+username <- commandArgs(trailingOnly = TRUE)[2]
+password <- commandArgs(trailingOnly = TRUE)[3]
+dayfrom <- commandArgs(trailingOnly = TRUE)[4]
+dayto <- commandArgs(trailingOnly = TRUE)[5]
+
+headers <- list('Accept' = 'application/json', 'Username' = username, 'Password' = password)
+curl = getCurlHandle()
+curlSetOpt(.opts = list(httpheader = headers, ssl.verifyhost = FALSE, ssl.verifypeer = FALSE, useragent = "RCurl"),
+           curl = curl)
+
+vplexget <- function(cmd) {
+  return(fromJSON(getURL(paste0('https://', ip, '/vplex', cmd), curl = curl))$response$context)
+}
+
+vplexcmd <- function(cmd, args = NULL) {
+  return(fromJSON(postForm(paste0('https://', ip, '/vplex/', cmd),
+                           .opts = list("postfields" = paste0("{\"args\":\"", args,"\"}")),
+                           curl = curl))$response$`custom-data`)
+}
+
+# Take information about VPLEX
+
+cinfo <- rbindlist(lapply(sapply(vplexget("/clusters")$children, '[[', 1),
+                          function(x) data.frame(cluster = x,
+                                                 assembly = vplexget(
+                                                   paste0("/clusters/", x,
+                                                          "?top-level-assembly"))$attributes[[1]]$value)))
+sviews <- lapply(unlist(lapply(vplexget("/clusters/*/exports/storage-views")$children, "[[", 1)),
+                 function(x) list(sview = x,
+                                  vol = unlist(head(lapply(str_split(vplexcmd("export+storage-view+map", x),
+                                                                     "\n")[[1]],
+                                                           function(y) str_split(y, " ")[[1]][2]), -1))))
+extents <- rbindlist(lapply(vplexget("/clusters/cluster-1/storage-elements/extents")$children[[1]]$name,
+                            function(x) data.frame(extent = x,
+                                                   svol = as.data.table(vplexget(
+                                                            paste0("/clusters/*/storage-elements/extents/",
+                                                                   x))$attributes[[1]])[name == "storage-volume",
+                                                                                        value][[1]],
+                                                   dev = as.data.table(vplexget(
+                                                           paste0("/clusters/*/storage-elements/extents/",
+                                                                  x))$attributes[[1]])[name == "used-by", value][[1]])))
+svols <- rbindlist(lapply(vplexget("/clusters/*/storage-elements/storage-volumes")$children[[1]]$name,
+                          function(x) data.frame(vol = gsub(":", ".", x),
+                                                 array = as.data.table(vplexget(
+                                                           paste0("/clusters/*/storage-elements/storage-volumes/",
+                                                                  x))$attributes[[1]])[name == "storage-array-name",
+                                                                                       value][[1]])))
+vvols <- rbindlist(lapply(vplexget("/clusters/*/virtual-volumes")$children[[1]]$name,
+                          function(x) data.frame(vol = x,
+                                                 dev = as.data.table(vplexget(
+                                                         paste0("/clusters/*/virtual-volumes/",
+                                                                x))$attributes[[1]])[name == "supporting-device",
+                                                                                     value][[1]])))
+vvolsdevs <- merge(vvols, extents, by = "dev")
+
+# Take performance data from the VPLEX
+
+monitors <- unlist(lapply(vplexget("/monitoring/directors/*/monitors")$children,'[[', 1))
+monitors <- monitors[!grepl('PERPETUAL', monitors)]
+
+mpf <- rbindlist(lapply(monitors,
+                        function(x) data.frame(monitor = x,
+                                               period = vplexget(paste0("/monitoring/directors/*/monitors/",
+                                                                        x, "?period"))$attributes[[1]]$value)))
+files <- lapply(monitors, function(x) vplexget(paste0("/monitoring/directors/*/monitors/", x,
+                                                      "/sinks/file?sink-to"))$attributes[[1]]$value)
+files[unlist(lapply(files, is.null))] <- NA
+mpf$file <- unlist(files)
+
+monitors <- mpf[period != '0s' & file != 'NA', ]
+monitors$monitor <- as.character(monitors$monitor)
+monitors$period <- as.character(monitors$period)
+monitors$file <- as.character(monitors$file)
+monitors$id <- rep(1:dim(monitors)[1])
+monitors <- as.data.table(monitors)
+
+mdirs <- rbindlist(lapply(monitors$monitor,
+                          function(x) data.frame(monitor = x,
+                                                 director = vplexget(paste0("/monitoring/directors/*/monitors/",
+                                                                            x))$parent)))
+mdirs$monitor <- as.character(mdirs$monitor)
+mdirs$director <- str_replace(str_replace(mdirs$director, "/monitoring/directors/", ""), "/monitors", "")
+mdirs$director <- str_replace(mdirs$director, 'director-', '')
+
+monitors <- merge(monitors, mdirs, by = 'monitor')
+rm(files, mpf, mdirs)
+
+mstats <- rbindlist(lapply(monitors$monitor,
+                           function(x) data.frame(monitor = x,
+                                                  statistics = vplexget(
+                                                    paste0("/monitoring/directors/*/monitors/",x,
+                                                           "?statistics"))$attributes[[1]]$value[[1]])))
+mstats$monitor <- as.character(mstats$monitor)
+mstats$statistics <- as.character(mstats$statistics)
+
+mtargets <- lapply(monitors$monitor, function(x) list(monitor = x,
+                                                      targets = vplexget(paste0("/monitoring/directors/*/monitors/", x,
+                                                                                "?targets"))$attributes[[1]]$value[[1]]))
+
+
+mdata <- apply(monitors, 1, function(x) list(monitor = x[1],
+                                             data = read.csv(text = scp(ip, x[3], user=username, password=password, binary = FALSE),
+                                                             stringsAsFactors = FALSE)))
+
+for(i in 1:length(mdata)) {
+  if(!is.na(dayfrom)) mdata[[i]]$data <- mdata[[i]]$data[mdata[[i]]$data$Time > dayfrom, ]
+  if(!is.na(dayto)) mdata[[i]]$data <- mdata[[i]]$data[mdata[[i]]$data$Time < dayto, ]
+}
+
+minfo <- rbindlist(lapply(mdata, function(x) data.frame(monitor = x$monitor,
+                                                        begin = head(x$data$Time, 1),
+                                                        end = tail(x$data$Time, 1))))
+```
+
+\newpage
+
+# Summary
+
+VPLEX clusters:
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, results = 'asis'}
+pandoc.table(cinfo)
+```
+
+Monitors with date:
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, results = 'asis'}
+pandoc.table(minfo, split.tables = 100)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, results = 'asis'}
+# Doing known stats
+
+# Directors
+
+if(length(monitors[monitor %in% mstats[grepl('director', mstats$statistics), ]$monitor, ]$id) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n# Directors\n\n")
+}  
+
+## director.busy
+
+ids <- monitors[monitor %in% mstats[grepl('director.busy', mstats$statistics), ]$monitor, ]$id
+if(length(ids) > 0) {
+  cat("\n\n## Directors Busy\n\n")
+
+  data = rbindlist(lapply(ids, function(m) data.frame(date = mdata[[m]]$data$Time,
+                                                      dir = monitors[id == m, ]$director,
+                                                      value = mdata[[m]]$data$director.busy....)))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                          round(max(value), digits = 2)), by='dir']
+    names(data.sum) <- c('director', 'p95', 'max')
+    pandoc.table(data.sum, caption = "Directors Busy", justify = c('left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+
+    ggplot(data=data, aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("%") + ggtitle("Directors Busy") + facet_grid(day ~ .) +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "1 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+  }
+}
+
+## director.per-cpu-busy
+
+ids <- monitors[monitor %in% mstats[grepl('director.per-cpu-busy', mstats$statistics), ]$monitor, ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## Directors per CPU Busy\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+           rbindlist(lapply(mtargets[[m]]$targets,
+                            function(c) data.frame(date = mdata[[m]]$data$Time,
+                                                   dir = monitors[id == m, ]$director,
+                                                   cpu = c,
+                                                   value = mdata[[m]]$data[, paste0('director.per.cpu.busy.', c, '....')],
+                                                   stringsAsFactors = FALSE)))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'cpu')]
+    names(data.sum) <- c('director', 'cpu',  'p95', 'max')
+    data.sum <- data.sum[order(data.sum$director), ]
+    data.sum <- data.sum[order(data.sum$cpu), ]
+    pandoc.table(data.sum, caption = "Directors Busy per CPU", justify = c('left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+
+    ggplot(data=data, aes(x=time, y=value, colour=cpu)) + geom_line() +
+      xlab("") + ylab("%") + ggtitle("Directors Per CPU Busy") + facet_grid(day ~ dir) +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "1 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+  }
+}
+
+# Front-end
+
+if(length(monitors[monitor %in% mstats[grepl('fe', mstats$statistics), ]$monitor, ]$id) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n# Front-end\n\n")
+}  
+
+## director.fe-ops
+
+ids <- monitors[monitor %in% unique(mstats[grepl('director.fe-ops', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n## Directors FE Operations\n\n")
+
+  data = rbindlist(lapply(ids, function(m) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.be.ops..counts.s.,
+                                                            type = 'total',
+                                                            stringsAsFactors = FALSE),
+                                                 data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.fe.ops.read..counts.s.,
+                                                            type = 'read',
+                                                            stringsAsFactors = FALSE),
+                                                 data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.fe.ops.write..counts.s.,
+                                                            type = 'write',
+                                                            stringsAsFactors = FALSE))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                           round(max(value), digits = 2)), by = c('dir', 'type')]
+    names(data.sum) <- c('director', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$type), ]
+    pandoc.table(data.sum, caption = "Directors FE Throughput", justify = c('left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+    
+    ggplot(data=data, aes(x=time, y=value, colour=type)) + geom_line() +
+      xlab("") + ylab("Counts/s") + ggtitle("Directors FE Operations") + facet_grid(day ~ dir, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "1 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+  }
+}
+
+## director.fe-read and director.fe-write
+
+ids <- monitors[monitor %in% unique(mstats[grepl('director.fe-(read|write)', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## Directors FE Bandwidth\n\n")
+
+  data = rbindlist(lapply(ids, function(m) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.fe.read..KB.s.,
+                                                            type = 'read',
+                                                            stringsAsFactors = FALSE),
+                                                 data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.fe.write..KB.s.,
+                                                            type = 'write',
+                                                            stringsAsFactors = FALSE))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1024
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'type')]
+    names(data.sum) <- c('director', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$type), ]
+    pandoc.table(data.sum, caption = "Directors FE Bandwidth", justify = c('left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+    
+    ggplot(data=data, aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("MB/s") + ggtitle("Directors FE Bandwith") + facet_grid(day ~ type, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "1 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+  }
+}
+
+## fe-director.read-avg-lat and fe-director.write-avg-lat
+
+ids <- monitors[monitor %in% unique(mstats[grepl('fe-director.(read|write)-avg-lat', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## Directors FE Average Latency\n\n")
+
+  data = rbindlist(lapply(ids,
+                          function(m) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                       dir = monitors[id == m, ]$director,
+                                                       value = mdata[[m]]$data$fe.director.read.lat.recent.average..us.,
+                                                       type = 'read',
+                                                       stringsAsFactors = FALSE),
+                                            data.frame(date = mdata[[m]]$data$Time,
+                                                       dir = monitors[id == m, ]$director,
+                                                       value = mdata[[m]]$data$director.fe.write..KB.s.,
+                                                       type = 'write',
+                                                       stringsAsFactors = FALSE))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1000
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'type')]
+    names(data.sum) <- c('director', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$type), ]
+    pandoc.table(data.sum, caption = "Directors FE Latency", justify = c('left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+    
+    ggplot(data=data, aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("ms") + ggtitle("Directors FE Latency") + facet_grid(day ~ type, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "1 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+  }
+}
+
+## fe-prt.ops
+
+ids <- monitors[monitor %in% unique(mstats[grepl('fe-prt.ops', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## FE Ports Operations\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+    rbindlist(lapply(mtargets[[m]]$targets,
+                     function(p) data.frame(date = mdata[[m]]$data$Time,
+                                            dir = monitors[id == m, ]$director,
+                                            port = str_replace(p, '(A|B)[0-9]-', ''),
+                                            value = mdata[[m]]$data[, paste0('fe.prt.ops.',
+                                                                             str_replace_all(p, '-', '.'),
+                                                                             '..counts.s.')],
+                                            stringsAsFactors = FALSE)))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'port')]
+    names(data.sum) <- c('director', 'port', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$port), ]
+    pandoc.table(data.sum, caption = "FE Ports Operations", justify = c('left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+    
+    ggplot(data=data, aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("Counts/s") + ggtitle("FE Ports Operations") + facet_grid(day ~ port, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+  }
+}
+
+## fe-prt.read and fe-prt.write
+
+ids <- monitors[monitor %in% unique(mstats[grepl('fe-prt.(read|write)', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## FE Ports Bandwidth\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+    rbindlist(lapply(mtargets[[m]]$targets,
+                     function(p) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  port = str_replace(p, '(A|B)[0-9]-', ''),
+                                                  value = mdata[[m]]$data[, paste0('fe.prt.read.',
+                                                                                   str_replace_all(p, '-', '.'),
+                                                                                   '..KB.s.')],
+                                                  type = 'read',
+                                                  stringsAsFactors = FALSE),
+                                       data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  port = str_replace(p, '(A|B)[0-9]-', ''),
+                                                  value = mdata[[m]]$data[, paste0('fe.prt.write.',
+                                                                                   str_replace_all(p, '-', '.'),
+                                                                                   '..KB.s.')],
+                                                  type = 'write',
+                                                  stringsAsFactors = FALSE))))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1024
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'port', 'type')]
+    names(data.sum) <- c('director', 'port', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$type), ]
+    data.sum <- data.sum[order(data.sum$port), ]
+    pandoc.table(data.sum, caption = "FE Ports Bandwith", justify = c('left', 'left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+    
+    g <- ggplot(data=data[type == 'read', ], aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("MB/s") + ggtitle("FE Ports Read Bandwith") + facet_grid(day ~ port, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+    print(g)
+
+    cat("\n\n\\pagebreak\n")
+
+    g <- ggplot(data=data[type == 'write', ], aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("MB/s") + ggtitle("FE Ports Write Bandwith") + facet_grid(day ~ port, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+    print(g)
+  }
+}
+
+## fe-prt.read-avg-lat and fe-prt.write-avg-lat
+
+ids <- monitors[monitor %in% unique(mstats[grepl('fe-prt.(read|write)-avg-lat', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## FE Ports Latency\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+    rbindlist(lapply(mtargets[[m]]$targets,
+                     function(p) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  port = str_replace(p, '(A|B)[0-9]-', ''),
+                                                  value = mdata[[m]]$data[, paste0('fe.prt.read.avg.lat.',
+                                                                                   str_replace_all(p, '-', '.'),
+                                                                                   '..us.')],
+                                                  type = 'read',
+                                                  stringsAsFactors = FALSE),
+                                       data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  port = str_replace(p, '(A|B)[0-9]-', ''),
+                                                  value = mdata[[m]]$data[, paste0('fe.prt.write.avg.lat.',
+                                                                                   str_replace_all(p, '-', '.'),
+                                                                                   '..us.')],
+                                                  type = 'write',
+                                                  stringsAsFactors = FALSE))))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1000
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'port', 'type')]
+    names(data.sum) <- c('director', 'port', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$type), ]
+    data.sum <- data.sum[order(data.sum$port), ]
+    pandoc.table(data.sum, caption = "FE Ports Latency", justify = c('left', 'left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+  
+    g <- ggplot(data=data[type == 'read', ], aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("ms") + ggtitle("FE Ports Read Latency") + facet_grid(day ~ port, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+    print(g)
+
+    cat("\n\n\\pagebreak\n")
+    
+    g <- ggplot(data=data[type == 'write', ], aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("ms") + ggtitle("FE Ports Write Latency") + facet_grid(day ~ port, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+    print(g)
+  }
+}
+
+# Back-end
+
+if(length(monitors[monitor %in% mstats[grepl('be', mstats$statistics), ]$monitor, ]$id) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n# Back-end\n\n")
+}  
+
+## director.be-ops
+
+ids <- monitors[monitor %in% unique(mstats[grepl('director.be-ops', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n## Directors BE Operations\n\n")
+
+  data = rbindlist(lapply(ids, function(m) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.be.ops..counts.s.,
+                                                            type = 'total',
+                                                            stringsAsFactors = FALSE),
+                                                 data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.be.ops.read..counts.s.,
+                                                            type = 'read',
+                                                            stringsAsFactors = FALSE),
+                                                 data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.be.ops.write..counts.s.,
+                                                            type = 'write',
+                                                            stringsAsFactors = FALSE))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'type')]
+    names(data.sum) <- c('director', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$type), ]
+    pandoc.table(data.sum, caption = "Directors BE Operations", justify = c('left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+
+    ggplot(data=data, aes(x=time, y=value, colour=type)) + geom_line() +
+      xlab("") + ylab("Counts/s") + ggtitle("Directors BE Operations") + facet_grid(day ~ dir, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "1 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+  }
+}  
+
+## director.be-read and director.be-write
+
+ids <- monitors[monitor %in% unique(mstats[grepl('director.be-(read|write)', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## Directors BE Bandwith\n\n")
+
+  data = rbindlist(lapply(ids, function(m) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.be.read..KB.s.,
+                                                            type = 'read',
+                                                            stringsAsFactors = FALSE),
+                                                 data.frame(date = mdata[[m]]$data$Time,
+                                                            dir = monitors[id == m, ]$director,
+                                                            value = mdata[[m]]$data$director.be.write..KB.s.,
+                                                            type = 'write',
+                                                            stringsAsFactors = FALSE))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1024
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'type')]
+    names(data.sum) <- c('director', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$type), ]
+    pandoc.table(data.sum, caption = "Directors BE Bandwith", justify = c('left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+  
+    ggplot(data=data, aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("MB/s") + ggtitle("Directors BE Bandwith") + facet_grid(day ~ type, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "1 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+  }
+}
+
+## be-prt.read and be-prt.write
+
+ids <- monitors[monitor %in% unique(mstats[grepl('be-prt.(read|write)', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## BE Ports Bandwith\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+    rbindlist(lapply(mtargets[[m]]$targets,
+                     function(p) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  port = str_replace(p, '(A|B)[0-9]-', ''),
+                                                  value = mdata[[m]]$data[, paste0('be.prt.read.',
+                                                                                   str_replace_all(p, '-', '.'),
+                                                                                   '..KB.s.')],
+                                                  type = 'read',
+                                                  stringsAsFactors = FALSE),
+                                       data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  port = str_replace(p, '(A|B)[0-9]-', ''),
+                                                  value = mdata[[m]]$data[, paste0('be.prt.write.',
+                                                                                   str_replace_all(p, '-', '.'),
+                                                                                   '..KB.s.')],
+                                                  type = 'write',
+                                                  stringsAsFactors = FALSE))))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1024
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'port', 'type')]
+    names(data.sum) <- c('director', 'port', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$type), ]
+    data.sum <- data.sum[order(data.sum$port), ]
+    pandoc.table(data.sum, caption = "BE Ports Bandwith", justify = c('left', 'left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+  
+    g <- ggplot(data=data[type == 'read', ], aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("MB/s") + ggtitle("BE Ports Read Bandwith") + facet_grid(day ~ port, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+    print(g)
+
+    cat("\n\n\\pagebreak\n")
+    
+    g <- ggplot(data=data[type == 'write', ], aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("MB/s") + ggtitle("BE Ports Write Bandwith") + facet_grid(day ~ port, scale = 'free') +
+      scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "1 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+    print(g)
+  }
+}
+
+# Front-end Volumes
+
+if(length(monitors[monitor %in% mstats[grepl('fe-lu', mstats$statistics), ]$monitor, ]$id) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n# Front-end Volumes\n\n")
+}  
+
+## fe-lu.ops
+
+ids <- monitors[monitor %in% unique(mstats[grepl('fe-lu.ops', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n## FE Volumes Operations\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+    rbindlist(lapply(mtargets[[m]]$targets,
+                     function(v) data.frame(date = mdata[[m]]$data$Time,
+                                            dir = monitors[id == m, ]$director,
+                                            vol = v,
+                                            value = mdata[[m]]$data[, paste0('fe.lu.ops.', v, '..counts.s.')],
+                                            stringsAsFactors = FALSE)))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'vol')]
+    names(data.sum) <- c('director', 'vol', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$vol), ]
+
+    for(v in sviews) {
+      dsum <- data.sum[vol %in% v$vol, .(vol, director, p95, max)]
+      if(dim(dsum)[1] > 0) {
+        cat(paste0("\n\n### ", v$sview, "\n\n"))
+        pandoc.table(dsum,
+                     caption = paste0("FE Volumes Operations in ", v$sview),
+                     justify = c('left', 'left', 'right', 'right'))
+        cat("\n\n\\pagebreak\n")
+
+        g <- ggplot(data=data[vol %in% v$vol, ], aes(x=time, y=value, colour=vol)) + geom_line() +
+               xlab("") + ylab("Counts/s") + ggtitle(paste0("FE Volumes Operations in ", v$sview)) +
+               facet_grid(day ~ dir, scale = 'free') +
+               scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+               theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+                     axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+        print(g)
+        cat("\n\n\\pagebreak\n")
+      }
+    }
+  }
+}
+
+## fe-lu.read and fe-lu.write
+
+ids <- monitors[monitor %in% unique(mstats[grepl('fe-lu.(read|write)', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## FE Volumes Bandwith\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+    rbindlist(lapply(mtargets[[m]]$targets,
+                     function(v) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  vol = v,
+                                                  value = mdata[[m]]$data[, paste0('fe.lu.read.', v, '..KB.s.')],
+                                                  type = 'read',
+                                                  stringsAsFactors = FALSE),
+                                       data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  vol = v,
+                                                  value = mdata[[m]]$data[, paste0('fe.lu.write.', v, '..KB.s.')],
+                                                  type = 'write',
+                                                  stringsAsFactors = FALSE))))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1024
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('vol', 'dir', 'type')]
+    names(data.sum) <- c('vol', 'director', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$vol), ]
+
+    for(v in sviews) {
+      dsum <- data.sum[vol %in% v$vol, ]
+      if(dim(dsum)[1] > 0) {
+        cat(paste0("\n\n### ", v$sview, "\n\n"))
+        pandoc.table(dsum,
+                     caption = paste0("FE Volumes Bandwith in ", v$sview),
+                     justify = c('left', 'left', 'left', 'right', 'right'))
+        cat("\n\n\\pagebreak\n")
+
+        g <- ggplot(data=data[vol %in% v$vol & type == 'read', ], aes(x=time, y=value, colour=vol)) + geom_line() +
+          xlab("") + ylab("MB/s") + ggtitle(paste0("FE Volumes Read Bandwith in ", v$sview)) +
+          facet_grid(day ~ dir, scale = 'free') + scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+          theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+                axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+        print(g)
+        cat("\n\n\\pagebreak\n")
+  
+        g <- ggplot(data=data[vol %in% v$vol & type == 'write', ], aes(x=time, y=value, colour=vol)) + geom_line() +
+          xlab("") + ylab("MB/s") + ggtitle(paste0("FE Volumes Write Bandwith in ", v$sview)) +
+          facet_grid(day ~ dir, scale = 'free') + scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+          theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+                axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+        print(g)
+        cat("\n\n\\pagebreak\n")
+      }
+    }
+  }
+}  
+
+## fe-lu.read-avg-lat and fe-lu.write-avg-lat
+
+ids <- monitors[monitor %in% unique(mstats[grepl('fe-lu.(read|write)-avg-lat', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## FE Volumes Average Latency\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+    rbindlist(lapply(mtargets[[m]]$targets,
+                     function(v) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  vol = v,
+                                                  value = mdata[[m]]$data[, paste0('fe.lu.read.avg.lat.', v, '..us.')],
+                                                  type = 'read',
+                                                  stringsAsFactors = FALSE),
+                                       data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  vol = v,
+                                                  value = mdata[[m]]$data[, paste0('fe.lu.write.avg.lat.', v, '..us.')],
+                                                  type = 'write',
+                                                  stringsAsFactors = FALSE))))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1000
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('vol', 'dir', 'type')]
+    names(data.sum) <- c('vol', 'director', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$vol), ]
+
+    for(v in sviews) {
+      dsum <- data.sum[vol %in% v$vol, ]
+      if(dim(dsum)[1] > 0) {
+        cat(paste0("\n\n### ", v$sview, "\n\n"))
+        pandoc.table(dsum,
+                     caption = paste0("FE Volumes Latency in storage-view ", v$sview),
+                     justify = c('left', 'left', 'left', 'right', 'right'))
+        cat("\n\n\\pagebreak\n")
+
+        g <- ggplot(data=data[vol %in% v$vol & type == 'read', ], aes(x=time, y=value, colour=vol)) + geom_line() +
+          xlab("") + ylab("ms") + ggtitle(paste0("FE Volumes Read Latency in ", v$sview)) +
+          facet_grid(day ~ dir, scale = 'free') + scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+          theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+                axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+        print(g)
+        cat("\n\n\\pagebreak\n")
+  
+        g <- ggplot(data=data[vol %in% v$vol & type == 'write', ], aes(x=time, y=value, colour=vol)) + geom_line() +
+          xlab("") + ylab("ms") + ggtitle(paste0("FE Volumes Write Latency in ", v$sview)) +
+          facet_grid(day ~ dir, scale = 'free') + scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+          theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+                axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+        print(g)
+        cat("\n\n\\pagebreak\n")
+      }
+    }
+  }
+}
+
+# Virtual volumes
+
+if(length(monitors[monitor %in% mstats[grepl('virtual-volume', mstats$statistics), ]$monitor, ]$id) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n# Virtual Volumes\n\n")
+}  
+
+## virtual-volume.ops
+
+ids <- monitors[monitor %in% unique(mstats[grepl('virtual-volume.ops', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n## Virtual Volumes Operations\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+    rbindlist(lapply(mtargets[[m]]$targets,
+                     function(v) data.frame(date = mdata[[m]]$data$Time,
+                                            dir = monitors[id == m, ]$director,
+                                            vol = v,
+                                            value = mdata[[m]]$data[, paste0('virtual.volume.ops.', v, '..counts.s.')],
+                                            stringsAsFactors = FALSE)))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'vol')]
+    names(data.sum) <- c('director', 'vol', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$vol), ]
+
+    for(v in sviews) {
+      dsum <- data.sum[vol %in% v$vol, .(vol, director, p95, max)]
+      if(dim(dsum)[1] > 0) {
+        cat(paste0("\n\n### ", v$sview, "\n\n"))
+        pandoc.table(dsum,
+                     caption = paste0("Virtual volumes Operations in ", v$sview),
+                     justify = c('left', 'left', 'right', 'right'))
+        cat("\n\n\\pagebreak\n")
+
+        g <- ggplot(data=data[vol %in% v$vol, ], aes(x=time, y=value, colour=vol)) + geom_line() +
+          xlab("") + ylab("Counts/s") + ggtitle(paste0("Virtual Volumes Operations in ", v$sview)) +
+          facet_grid(day ~ dir, scale = 'free') +
+          scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+          theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+                axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+        print(g)
+        cat("\n\n\\pagebreak\n")
+      }
+    }
+  }
+}
+
+## virtual-volume.read and virtual-volume.write
+
+ids <- monitors[monitor %in% unique(mstats[grepl('virtual-volume.(read|write)', mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## Virtual Volumes Bandwith\n\n")
+
+  data = rbindlist(lapply(ids, function(m)
+    rbindlist(lapply(mtargets[[m]]$targets,
+                     function(v) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  vol = v,
+                                                  value = mdata[[m]]$data[, paste0('virtual.volume.read.', v, '..KB.s.')],
+                                                  type = 'read',
+                                                  stringsAsFactors = FALSE),
+                                       data.frame(date = mdata[[m]]$data$Time,
+                                                  dir = monitors[id == m, ]$director,
+                                                  vol = v,
+                                                  value = mdata[[m]]$data[, paste0('virtual.volume.write.', v, '..KB.s.')],
+                                                  type = 'write',
+                                                  stringsAsFactors = FALSE))))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1024
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('vol', 'dir', 'type')]
+    names(data.sum) <- c('vol', 'director', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$vol), ]
+
+    for(v in sviews) {
+      dsum <- data.sum[vol %in% v$vol, ]
+      if(dim(dsum)[1] > 0) {
+        cat(paste0("\n\n### ", v$sview, "\n\n"))
+        pandoc.table(dsum,
+                     caption = paste0("virtual Volumes Bandwith in ", v$sview),
+                     justify = c('left', 'left', 'left', 'right', 'right'))
+        cat("\n\n\\pagebreak\n")
+
+        g <- ggplot(data=data[vol %in% v$vol & type == 'read', ], aes(x=time, y=value, colour=vol)) + geom_line() +
+          xlab("") + ylab("MB/s") + ggtitle(paste0("Virtual Volumes Read Bandwith in ", v$sview)) +
+          facet_grid(day ~ dir, scale = 'free') + scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+          theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+               axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+        print(g)
+        cat("\n\n\\pagebreak\n")
+  
+        g <- ggplot(data=data[vol %in% v$vol & type == 'write', ], aes(x=time, y=value, colour=vol)) + geom_line() +
+          xlab("") + ylab("MB/s") + ggtitle(paste0("Virtual Volumes Write Bandwith in ", v$sview)) +
+          facet_grid(day ~ dir, scale = 'free') + scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+          theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+                axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+        print(g)
+        cat("\n\n\\pagebreak\n")
+      }
+    }
+  }
+}
+
+# Storage volumes
+
+if(length(monitors[monitor %in% mstats[grepl('storage-volume', mstats$statistics), ]$monitor, ]$id) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n# Storage Volumes\n\n")
+}  
+
+## storage-volume.read-avg-lat and storage-volume.write-avg-lat
+
+ids <- monitors[monitor %in% unique(mstats[grepl('storage-volume.(read|write)-avg-lat',
+                                                 mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n## Storage Volumes Average Latency\n\n")
+
+  data = rbindlist(
+    lapply(ids, function(m) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                             dir = monitors[id == m, ]$director,
+                                             value = mdata[[m]]$data[,'storage.volume.read.latency.recent.average..us.'],
+                                             type = 'read',
+                                             stringsAsFactors = FALSE),
+                                  data.frame(date = mdata[[m]]$data$Time,
+                                             dir = monitors[id == m, ]$director,
+                                             value = mdata[[m]]$data[, 'storage.volume.write.latency.recent.average..us.'],
+                                             type = 'write',
+                                             stringsAsFactors = FALSE))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1000
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('dir', 'type')]
+    names(data.sum) <- c('director', 'type', 'p95', 'max')
+    data.sum <- data.sum[order(data.sum$type), ]
+    pandoc.table(data.sum, caption = "Storage Volumes Latency", justify = c('left', 'left', 'right', 'right'))
+
+    cat("\n\n\\pagebreak\n")
+    
+    ggplot(data=data, aes(x=time, y=value, colour=dir)) + geom_line() +
+      xlab("") + ylab("ms") + ggtitle("Storage Volumes Latency") +
+      facet_grid(day ~ type, scale = 'free') + scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+      theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+            axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+  }
+}
+
+# storage-volume.per-storage-volume-read-avg-lat and storage-volume.per-storage-volume-write-avg-lat
+
+ids <- monitors[monitor %in% unique(mstats[grepl('storage-volume.(read|write)-avg-lat',
+                                                 mstats$statistics), ]$monitor), ]$id
+if(length(ids) > 0) {
+  cat("\n\n\\pagebreak\n")
+  cat("\n\n## Storage Volumes Latency\n\n")
+
+  data = rbindlist(
+    lapply(ids, function(m)
+      rbindlist(lapply(mtargets[[m]]$targets,
+                       function(v) rbind(data.frame(date = mdata[[m]]$data$Time,
+                                                    dir = monitors[id == m, ]$director,
+                                                    vol = gsub(":", ".", v),
+                                                    value = mdata[[m]]$data[, paste0(
+                                                      'storage.volume.per.storage.volume.read.avg.lat.',
+                                                      gsub(":", ".", v), '..us.')],
+                                                    type = 'read',
+                                                    stringsAsFactors = FALSE),
+                                         data.frame(date = mdata[[m]]$data$Time,
+                                                    dir = monitors[id == m, ]$director,
+                                                    vol = gsub(":", ".", v),
+                                                    value = mdata[[m]]$data[, paste0(
+                                                      'storage.volume.per.storage.volume.write.avg.lat.',
+                                                      gsub(":", ".", v), '..us.')],
+                                                    type = 'write',
+                                                    stringsAsFactors = FALSE))))))
+  if(dim(data)[1] > 0) {
+    data$day <- as.factor(str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\1" ))
+    data$time <- str_replace_all(data$date, "([0-9]+-[0-9]+-[0-9]+) ([0-9]+:[0-9]+:[0-9]+)", "\\2")
+    data$time <- as.POSIXct(strptime(data$time, "%H:%M:%S", tz = "UTC"))
+    data$value = data$value / 1000
+    data <- merge(data, svols, by = 'vol')
+
+    data.sum <- data[, list(round(quantile(value, c(0.95), na.rm = TRUE), digits = 2),
+                            round(max(value), digits = 2)), by = c('vol', 'dir', 'type', 'array')]
+    names(data.sum) <- c('vol', 'director', 'type', 'array', 'p95', 'max')
+
+    for(v in sviews) {
+      dsum <- data.sum[vol %in% vvolsdevs[vol %in% v$vol, svol], ]
+      if(dim(dsum)[1] > 0) {
+        cat(paste0("\n\n### ", v$sview, "\n\n"))
+        pandoc.table(dsum,
+                     caption = paste0("Storage Volumes Latency in ", v$sview),
+                     justify = c('left', 'left', 'left', 'left', 'right', 'right'))
+        cat("\n\n\\pagebreak\n")
+
+        for(a in levels(data[vol %in% vvolsdevs[vol %in% v$vol, svol], array])) {
+          if(dim(data[vol %in% vvolsdevs[vol %in% v$vol, svol] & array == a, ])[1] > 0) {
+            g <- ggplot(data=data[vol %in% vvolsdevs[vol %in% v$vol, svol] & array == a & type == 'read', ],
+                      aes(x=time, y=value, colour=vol)) +
+              geom_line() + xlab("") + ylab("ms") +
+              ggtitle(paste0("Read Latency in ", v$sview, " on ", a)) +
+              facet_grid(day ~ dir, scale = 'free') + scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+              theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+                    axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+            print(g)
+            cat("\n\n\\pagebreak\n")
+
+            g <- ggplot(data=data[vol %in% vvolsdevs[vol %in% v$vol, svol] & array == a & type == 'write', ],
+                        aes(x=time, y=value, colour=vol)) +
+              geom_line() + xlab("") + ylab("ms") +
+              ggtitle(paste0("Write Latency in ", v$sview, " on ", a)) +
+              facet_grid(day ~ dir, scale = 'free') + scale_x_datetime(date_labels = "%H:%M %Z", date_breaks = "2 hour") +
+              theme(axis.text.x = element_text(angle = 90), strip.text.y = element_text(angle = 0),
+                    axis.text.y = element_text(size = rel(0.7)), legend.title = element_blank())
+            print(g)
+            cat("\n\n\\pagebreak\n")
+          }
+        }
+      }
+    }
+  }
+}
+```
